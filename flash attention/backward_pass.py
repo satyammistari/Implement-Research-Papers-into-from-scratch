@@ -1,4 +1,3 @@
-
 import math
 import sys
 
@@ -8,11 +7,7 @@ try:
 except ImportError:
     NUMPY = False
 
-try:
-    import torch
-    TORCH = True
-except ImportError:
-    TORCH = False
+TORCH = False
 
 if not NUMPY and not TORCH:
     sys.exit("Need at least numpy. pip install numpy")
@@ -60,51 +55,29 @@ def max_diff(a, b):
     if TORCH: return float((to64(a) - to64(b)).abs().max())
     else:     return float(abs(to64(a) - to64(b)).max())
 
-
-
-# 3A  Standard backward pass  (Algorithm 3 in paper — O(N²) memory)
-
 def standard_attention_backward(Q, K, V, O, dO, P):
-    """
-    Naive backward — requires the full N×N attention matrix P in HBM.
-    This is what FlashAttention's backward replaces.
-
-    HBM cost: Θ(Nd + N²)  — dominated by reading/writing P
-    """
     d = Q.shape[-1]
     sc = 1.0 / math.sqrt(d)
 
-                              
     dV = matmul(swap_last2(P), dO)
-
-                                
     dP = matmul(dO, swap_last2(V))
 
-    
     if TORCH:
-        D = (P * dP).sum(dim=-1)             
+        D = (P * dP).sum(dim=-1)
     else:
         D = (P * dP).sum(axis=-1)
 
-    
-    dS = P * (dP - D[..., None])            
+    dS = P * (dP - D[..., None])
 
-    
     dQ = matmul(dS, K) * sc
-    
     dK = matmul(swap_last2(dS), Q) * sc
 
     return dQ, dK, dV
-
-
-
-# 3B  FlashAttention backward pass  (Algorithm 4 — O(N) memory)
 
 def flash_attention_backward(Q, K, V, O, dO, L,
                               BLOCK_M: int = 32,
                               BLOCK_N: int = 32,
                               causal:  bool = False):
-    
     B, H, N, d = Q.shape
     sc = 1.0 / math.sqrt(d)
 
@@ -112,40 +85,34 @@ def flash_attention_backward(Q, K, V, O, dO, L,
     dK = zeros(B, H, N, d)
     dV = zeros(B, H, N, d)
 
-    
     if TORCH:
-        D = (to64(dO) * to64(O)).sum(dim=-1)   
+        D = (to64(dO) * to64(O)).sum(dim=-1)
     else:
         D = (to64(dO) * to64(O)).sum(axis=-1)
 
     Q64  = to64(Q);   K64  = to64(K);   V64  = to64(V)
     dO64 = to64(dO);  L64  = to64(L)
 
-    
     for tile_j in range(0, N, BLOCK_N):
         je  = min(tile_j + BLOCK_N, N)
-        Kj  = K64[:, :, tile_j:je, :]          
-        Vj  = V64[:, :, tile_j:je, :]          
+        Kj  = K64[:, :, tile_j:je, :]
+        Vj  = V64[:, :, tile_j:je, :]
         j_idx = list(range(tile_j, je))
 
-        
         dKj_acc = zeros(B, H, je - tile_j, d)
         dVj_acc = zeros(B, H, je - tile_j, d)
 
-        
         for tile_i in range(0, N, BLOCK_M):
             ie   = min(tile_i + BLOCK_M, N)
-            Qi   = Q64[:, :, tile_i:ie, :]     
-            Oi   = to64(O)[:, :, tile_i:ie, :] 
-            dOi  = dO64[:, :, tile_i:ie, :]    
-            Li   = L64[:, :, tile_i:ie]         
-            Di   = D[:, :, tile_i:ie]           
+            Qi   = Q64[:, :, tile_i:ie, :]
+            Oi   = to64(O)[:, :, tile_i:ie, :]
+            dOi  = dO64[:, :, tile_i:ie, :]
+            Li   = L64[:, :, tile_i:ie]
+            Di   = D[:, :, tile_i:ie]
             i_idx = list(range(tile_i, ie))
 
-            
-            Sij = matmul(Qi, swap_last2(Kj)) * sc   
+            Sij = matmul(Qi, swap_last2(Kj)) * sc
 
-            
             if causal:
                 for bi in range(len(i_idx)):
                     for bj in range(len(j_idx)):
@@ -153,32 +120,23 @@ def flash_attention_backward(Q, K, V, O, dO, L,
                             if TORCH: Sij[:,:,bi,bj] = float('-inf')
                             else:     Sij[:,:,bi,bj] = -np.inf
 
-            
-            Pij = exp(Sij - Li[..., None])          
+            Pij = exp(Sij - Li[..., None])
             if TORCH:
                 Pij = torch.where(torch.isnan(Pij), torch.zeros_like(Pij), Pij)
             else:
                 Pij = np.where(np.isnan(Pij), 0.0, Pij)
 
-            
-            dVj_acc += matmul(swap_last2(Pij), dOi)   
+            dVj_acc += matmul(swap_last2(Pij), dOi)
+            dPij = matmul(dOi, swap_last2(Vj))
+            dSij = Pij * (dPij - Di[..., None])
 
-            
-            dPij = matmul(dOi, swap_last2(Vj))         
-
-            
-            dSij = Pij * (dPij - Di[..., None])        
-
-            
             if TORCH:
                 dQ[:, :, tile_i:ie, :] += (matmul(dSij, Kj) * sc).float()
             else:
                 dQ[:, :, tile_i:ie, :] += matmul(dSij, Kj) * sc
 
-            
             dKj_acc += matmul(swap_last2(dSij), Qi) * sc
 
-        
         if TORCH:
             dK[:, :, tile_j:je, :] += dKj_acc.float()
             dV[:, :, tile_j:je, :] += dVj_acc.float()
@@ -190,10 +148,6 @@ def flash_attention_backward(Q, K, V, O, dO, L,
         return dQ.float(), dK.float(), dV.float()
     else:
         return dQ, dK, dV
-
-
-
-# 3C  Reference: compute exact P for standard backward comparison
 
 def compute_attention_and_P(Q, K, V, causal=False):
     d  = Q.shape[-1]
@@ -221,11 +175,6 @@ def compute_attention_and_P(Q, K, V, causal=False):
         L  = np.log(eS.sum(axis=-1)) + S.max(axis=-1)
         return O.astype(Q.dtype), P, L
 
-
-
-# 3D  Verification
-
-
 def randn(*shape, seed=0):
     if TORCH:
         torch.manual_seed(seed)
@@ -234,13 +183,11 @@ def randn(*shape, seed=0):
         rng = np.random.default_rng(seed)
         return rng.standard_normal(shape).astype(np.float32)
 
-
 def run_tests():
     print("=" * 65)
     print("SECTION 3: FlashAttention Backward Pass — Verification")
     print("=" * 65)
 
-    #  A: gradients match standard backward 
     print("\n[A] Gradient correctness: flash_bwd == standard_bwd")
     print(f"    {'config':<35} {'dQ err':>8} {'dK err':>8} {'dV err':>8}")
     print(f"    {'-'*65}")
@@ -278,7 +225,6 @@ def run_tests():
         status = "PASS" if ok else "FAIL"
         print(f"    {status}  {label:<35} {eq:>8.1e} {ek:>8.1e} {ev:>8.1e}")
 
-    #  B: D_i = dO_i^T o_i  trick verification 
     print("\n[B] D_i trick: rowsum(P⊙dP) == (dO)^T O  (Eq. 4 in paper)")
     print(f"    {'config':<30} {'max_err':>10} {'status'}")
     print(f"    {'-'*50}")
@@ -291,10 +237,8 @@ def run_tests():
         O, P, L = compute_attention_and_P(Q, K, V)
         dP = matmul(dO, swap_last2(V))
 
-        # Standard way: D_i = rowsum(P_i: ⊙ dP_i:)
         if TORCH:
             D_standard = (to64(P) * to64(dP)).sum(dim=-1)
-            # Flash trick: D_i = (dO_i)^T o_i
             D_flash    = (to64(dO) * to64(O)).sum(dim=-1)
         else:
             D_standard = (to64(P) * to64(dP)).sum(axis=-1)
@@ -305,7 +249,6 @@ def run_tests():
         print(f"    {'PASS' if ok else 'FAIL'}  B={B} H={H} N={N} d={d}              err={err:.2e}")
         all_pass = all_pass and ok
 
-    #  C: memory savings 
     print("\n[C] Memory saved: not storing N×N P during backward")
     print(f"    {'N':>8} {'Store P (MB)':>14} {'Store L (KB)':>14} {'Saving':>10}")
     print(f"    {'-'*52}")
@@ -317,19 +260,6 @@ def run_tests():
     print("\n" + "=" * 65)
     print("ALL TESTS PASSED" if all_pass else "SOME TESTS FAILED")
     print("=" * 65)
-
-    print("""
-  1. The recomputation cost is O(N²d) FLOPs — same as standard backward.
-     The win is not in FLOPs but in HBM accesses: Θ(N²d²/M) instead of Θ(N²).
-
-  2.  is elegant: instead of a full N-dim
-     reduction over P_i:, we compute a d-dim dot product. Since d << N,
-     this fits easily in SRAM.
-
-  3. dK and dV are accumulated inside the inner loop (like the output O
-     in the forward pass), written to HBM only once per outer tile.
-     This is what keeps the backward HBM cost at Θ(N²d²/M).
-""")
 
 
 if __name__ == "__main__":

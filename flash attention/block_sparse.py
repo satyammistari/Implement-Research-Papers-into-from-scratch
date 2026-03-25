@@ -3,10 +3,15 @@
 import math, sys, random
 import numpy as np
 
-try:
-    import torch; TORCH = True
-except ImportError:
-    TORCH = False
+# Force numpy backend
+TORCH = False
+
+# try:
+#     import torch
+#     _ = torch.zeros(1)  # Test if torch actually works
+#     TORCH = True
+# except (ImportError, OSError, RuntimeError, TypeError):
+#     TORCH = False
 
 print(f"[INFO] Using {'torch' if TORCH else 'numpy'} backend\n")
 
@@ -16,21 +21,17 @@ print(f"[INFO] Using {'torch' if TORCH else 'numpy'} backend\n")
 
 
 def causal_mask(N, Br, Bc):
-    """Lower-triangular block mask. s ≈ 0.5 → 2× speedup."""
+    
     Tr, Tc = math.ceil(N/Br), math.ceil(N/Bc)
     return [[1 if i*Br >= j*Bc else 0 for j in range(Tc)] for i in range(Tr)]
 
 def local_window_mask(N, Br, Bc, window=2):
-    """Sliding local window. s = (2w+1)/Tc → Θ(N) IO."""
+    
     Tr, Tc = math.ceil(N/Br), math.ceil(N/Bc)
     return [[1 if abs(i-j) <= window else 0 for j in range(Tc)] for i in range(Tr)]
 
 def butterfly_mask(N, Br, Bc):
-    """
-    Butterfly (log-stride) pattern. IO: Θ(N log N).
-    Block (i,j)=1 if j = i XOR (1<<k) for any k.
-    Proved to approximate any structured sparse matrix (Dao et al. 2019).
-    """
+    
     Tr, Tc = math.ceil(N/Br), math.ceil(N/Bc)
     mask = [[0]*Tc for _ in range(Tr)]
     for i in range(min(Tr, Tc)):
@@ -47,6 +48,52 @@ def butterfly_mask(N, Br, Bc):
 def random_block_mask(Tr, Tc, density=0.3, seed=0):
     rng = random.Random(seed)
     return [[1 if rng.random() < density else 0 for _ in range(Tc)] for _ in range(Tr)]
+def biology_informed_mask(N: int, Br: int, Bc: int) -> list[list[list[int]]]:
+
+    Tr, Tc = math.ceil(N/Br), math.ceil(N/Bc)
+    mask = [[0]*Tc for _ in range(Tr)]
+
+    for i in range(Tr):
+        for j in range(Tc):
+            dist = abs(i - j) * Br
+        
+        #always attend to self and immediate neighbours
+        if dist == 0:
+            mask[i][j] = 1
+        
+        #local chromatin - short range interactions
+        elif dist < 1_000:
+            mask[i][j] = 1
+
+        #enhance -promoter loops
+        elif 40_000 <= dist < 60_000:
+            mask[i][j] = 1
+
+        #TAD boundaries
+        elif (dist % 1_000_000) < 10_000:
+            mask[i][j] = 1
+
+    return mask    
+
+
+def bilogy_maskl_stats(mask: list[list[int]]) -> dict:
+
+    Tr, Tc = len(mask), len(mask[0])
+    total_blocks = Tr * Tc
+    nonzero_blocks = sum(mask[i][j] for i in range(Tr) for j in range(Tc)) 
+
+    return{
+        "total_blocks": total_blocks,
+        "nonzero_blocks": nonzero_blocks,
+        "sparsity": nonzero_blocks / total_blocks,
+        "skip_fractions": 1 - nonzero_blocks / total_blocks,
+        "io_reduction": f"{(1 / nonzero_blocks / total_blocks):.1f}x vs dense"
+    }
+    
+
+
+
+
 
 def sparsity(mask):
     Tr, Tc = len(mask), len(mask[0])
@@ -78,7 +125,7 @@ def _update(Oi, mi, li, Sij, Vj):
 # 4C  Dense reference with block mask
 
 def masked_attention_reference(Q, K, V, block_mask, Br, Bc):
-    """Build full N×N score matrix with masked blocks set to -inf, then softmax."""
+    
     B, H, N, d = Q.shape
     sc  = 1.0 / math.sqrt(d)
     Tr  = math.ceil(N / Br); Tc = math.ceil(N / Bc)
@@ -159,9 +206,8 @@ def block_sparse_flash_attention(Q, K, V, block_mask, BLOCK_M=32, BLOCK_N=32):
     return O_.astype(Q.dtype), L, blocks_computed
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+
 # 4E  Verification + analysis
-# ─────────────────────────────────────────────────────────────────────────────
 
 def randn(*shape, seed=0):
     return np.random.default_rng(seed).standard_normal(shape).astype(np.float32)
@@ -247,20 +293,7 @@ def run_tests():
     print("\n" + "="*65)
     print("ALL TESTS PASSED" if all_pass else "SOME TESTS FAILED")
     print("="*65)
-    print("""
-  1. Algorithm 5 = Algorithm 1 + single `if mask==0: continue`.
-     Running state (m,l,O) persists across K/V tiles even when blocks
-     are skipped — skipped blocks leave state unchanged (correct).
-
-  2. Causal attention is a free 2× speedup — pass causal_mask().
-     No quality loss: it's exact, not approximate.
-
-  3. Butterfly + N=65536: IO = Θ(N log N) ~ 0.6 MB vs 17 GB standard.
-     That's why block-sparse FA was the first to solve Path-256.
-
-  4. For Section 5 (end-to-end): wrap flash_attention_forward +
-     flash_attention_backward into an nn.Module with autograd.
-""")
+    
 
 if __name__ == "__main__":
     run_tests()
