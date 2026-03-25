@@ -179,6 +179,122 @@ class BlockSparseFlashAttentionLayer(FlashAttentionLayer):
         return O_flat @ self.W_O
 
 
+class DNAFlashAttentionLayer:
+    def __init__(self, embed_dim: int, num_heads: int,
+                 BLOCK_M: int = 32, BLOCK_N: int = 32,
+                 mask_type: str = 'dense',   # 'dense','biology','dynamic'
+                 budget: float = 0.2,        # for dynamic only
+                 seed: int = 0):
+
+        assert embed_dim % num_heads == 0
+        self.embed_dim  = embed_dim
+        self.num_heads  = num_heads
+        self.head_dim   = embed_dim // num_heads
+        self.BLOCK_M    = BLOCK_M
+        self.BLOCK_N    = BLOCK_N
+        self.mask_type  = mask_type
+        self.budget     = budget
+
+        rng   = np.random.default_rng(seed)
+        scale = 1.0 / math.sqrt(embed_dim)
+
+        self.W_Q = rng.standard_normal(
+            (embed_dim, embed_dim)).astype(np.float32) * scale
+        self.W_K = rng.standard_normal(
+            (embed_dim, embed_dim)).astype(np.float32) * scale
+        self.W_V = rng.standard_normal(
+            (embed_dim, embed_dim)).astype(np.float32) * scale
+        self.W_O = rng.standard_normal(
+            (embed_dim, embed_dim)).astype(np.float32) * scale
+
+        # IO tracking — filled by profiler wrapper
+        self.last_io_bytes  = 0
+        self.last_time_ms   = 0
+        self.selected_blocks = None   # for dynamic mask visualization
+
+    def _get_mask(self, N):
+        
+        if self.mask_type == 'dense':
+            return None   
+
+        Tr = math.ceil(N / self.BLOCK_M)
+        Tc = math.ceil(N / self.BLOCK_N)
+
+        if self.mask_type == 'biology':
+            from block_sparse import biology_informed_mask
+            return biology_informed_mask(N, self.BLOCK_M, self.BLOCK_N)
+
+        elif self.mask_type == 'causal':
+            from block_sparse import causal_mask
+            return causal_mask(N, self.BLOCK_M, self.BLOCK_N)
+
+        elif self.mask_type == 'dynamic':
+            # Computed from Q/K pooling — done inside forward()
+            return 'dynamic'
+
+        elif self.mask_type == 'butterfly':
+            from block_sparse import butterfly_mask
+            return butterfly_mask(N, self.BLOCK_M, self.BLOCK_N)
+
+    def forward(self, x: np.ndarray) -> np.ndarray:
+        B, N, E = x.shape
+        H, D    = self.num_heads, self.head_dim
+
+        # Project
+        Q_flat = x @ self.W_Q
+        K_flat = x @ self.W_K
+        V_flat = x @ self.W_V
+
+        def reshape(t):
+            return t.reshape(B, N, H, D).transpose(0, 2, 1, 3)
+
+        Q = reshape(Q_flat)
+        K = reshape(K_flat)
+        V = reshape(V_flat)
+
+        mask = self._get_mask(N)
+
+        if mask is None:
+            # Dense FlashAttention (Section 2)
+            O, L = flash_attention_forward(
+                Q, K, V, self.BLOCK_M, self.BLOCK_N)
+
+        elif mask == 'dynamic':
+            # Dynamic sparse: score blocks cheaply, keep top-k
+            Tr = math.ceil(N / self.BLOCK_M)
+            Tc = math.ceil(N / self.BLOCK_N)
+
+            Q_pool = Q.reshape(B, H, Tr, self.BLOCK_M, D).mean(axis=3)
+            K_pool = K.reshape(B, H, Tc, self.BLOCK_N, D).mean(axis=3)
+            scores = Q_pool @ K_pool.swapaxes(-2, -1)  
+
+
+            avg_scores = scores.mean(axis=(0, 1))      
+            k          = max(1, int(self.budget * Tc))
+
+            dynamic_mask = [[0]*Tc for _ in range(Tr)]
+            for i in range(Tr):
+                topk = np.argpartition(avg_scores[i], -k)[-k:]
+                for j in topk:
+                    dynamic_mask[i][j] = 1
+
+            # Save for visualization
+            self.selected_blocks = dynamic_mask
+
+            from block_sparse import block_sparse_flash_attention
+            O, L, _ = block_sparse_flash_attention(
+                Q, K, V, dynamic_mask, self.BLOCK_M, self.BLOCK_N)
+
+        else:
+            # Biology / causal / butterfly mask (Section 4)
+            from block_sparse import block_sparse_flash_attention
+            O, L, _ = block_sparse_flash_attention(
+                Q, K, V, mask, self.BLOCK_M, self.BLOCK_N)
+
+        O_flat = O.transpose(0, 2, 1, 3).reshape(B, N, E)
+        return O_flat @ self.W_O
+
+
 
 # 5D  Verification + benchmarking
 
